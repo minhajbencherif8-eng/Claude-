@@ -244,6 +244,64 @@ class Index:
             for r in rows
         ]
 
+    # ---------- rankings ----------
+
+    # One row per declared salary: the same company can be in several PDFs (grouped by
+    # affiliation n°, else by name) and the same person/period can repeat, so duplicates
+    # are collapsed before averaging.
+    _RANK_BASE = """
+        WITH c AS MATERIALIZED (
+            SELECT id, name, source,
+                   COALESCE(NULLIF(json_extract(details, '$."N° d''affiliation"'), ''), search) AS ckey,
+                   COALESCE(json_extract(details, '$.Ville'), '') AS city
+            FROM companies),
+        e AS (
+            SELECT c.ckey, COALESCE(NULLIF(e.ref, ''), e.search) AS pkey, e.period,
+                   MAX(e.salary) AS salary, MAX(e.days) AS days, e.name, e.ref, MAX(c.id) AS cid
+            FROM employees e JOIN c ON c.id = e.company_id
+            WHERE e.salary > 0 AND c.city LIKE ? AND (? <= 1 OR e.days >= ?)
+            GROUP BY c.ckey, pkey, e.period)
+    """
+    RANK_BY = {"salary": "Salary", "per_day": "Salary per day worked"}
+
+    def top_companies(self, by: str = "salary", min_employees: int = 1, city: str = "",
+                      limit: int = 100, min_days: int = 1) -> list[dict]:
+        """Companies ranked by average declared salary (or average salary per day worked).
+
+        Only declarations with at least `min_days` days worked count (26 = full months only).
+        """
+        order = "avg_day" if by == "per_day" else "avg_salary"
+        rows = self.db.execute(self._RANK_BASE + f""",
+        g AS (
+            SELECT ckey, COUNT(DISTINCT pkey) AS people, AVG(salary) AS avg_salary,
+                   AVG(CASE WHEN days > 0 THEN salary / days END) AS avg_day,
+                   MAX(salary) AS max_salary, SUM(salary) AS total
+            FROM e GROUP BY ckey),
+        cc AS (SELECT ckey, COUNT(*) AS pdfs, MAX(id) AS cid FROM c GROUP BY ckey)
+        SELECT g.*, cc.pdfs, cc.cid, c.name AS company, c.city
+        FROM g JOIN cc ON cc.ckey = g.ckey JOIN c ON c.id = cc.cid
+        WHERE g.people >= ? AND g.{order} IS NOT NULL
+        ORDER BY g.{order} DESC LIMIT ?""",
+            (f"%{city.strip()}%", min_days, min_days, max(1, min_employees), limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def top_earners(self, by: str = "salary", city: str = "", limit: int = 100,
+                    min_days: int = 1) -> list[dict]:
+        """People ranked by their highest declared salary (or salary per day worked).
+
+        Only declarations with at least `min_days` days worked count.
+        """
+        value = ("e.salary / e.days" if by == "per_day" else "e.salary")
+        rows = self.db.execute(self._RANK_BASE + f"""
+            SELECT e.name, e.ref, e.period, e.days, e.salary, MAX({value}) AS score,
+                   e.cid AS company_id, c.name AS company, c.city, c.source,
+                   COUNT(DISTINCT e.ckey) AS companies
+            FROM e JOIN c ON c.id = e.cid
+            WHERE {"e.days > 0" if by == "per_day" else "1"}
+            GROUP BY e.pkey ORDER BY score DESC LIMIT ?""",
+            (f"%{city.strip()}%", min_days, min_days, limit)).fetchall()
+        return [dict(r) | {"per_day": r["salary"] / r["days"] if r["days"] else None} for r in rows]
+
     def company(self, company_id: int) -> dict:
         return self._company_dict(self.db.execute("SELECT * FROM companies WHERE id = ?", (company_id,)).fetchone())
 

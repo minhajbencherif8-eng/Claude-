@@ -54,6 +54,12 @@ class App:
         self.mode = tk.StringVar(value="company")
         self.query = tk.StringVar()
         self.status = tk.StringVar()
+        self.view = "company"  # what the results list shows: company, person, top_companies, top_people
+        self.rank_by = tk.StringVar(value=Index.RANK_BY["salary"])
+        self.min_employees = tk.StringVar(value="3")
+        self.min_days = tk.StringVar(value="1")
+        self.city = tk.StringVar()
+        self.top_n = tk.StringVar(value="100")
 
         root.title(APP_NAME)
         root.geometry("1200x780")
@@ -92,6 +98,25 @@ class App:
         entry.focus_set()
         ttk.Button(bar, text="Search", command=self.search).pack(side="left", padx=6)
         ttk.Button(bar, text="Export to Excel (CSV)", command=self.export_csv).pack(side="left")
+
+        ranks = ttk.Frame(self.root)
+        ranks.pack(fill="x", **pad)
+        ttk.Label(ranks, text="Rankings:").pack(side="left")
+        ttk.Button(ranks, text="Top companies by avg salary",
+                   command=self.rank_companies).pack(side="left", padx=(8, 0))
+        ttk.Button(ranks, text="Top earners", command=self.rank_people).pack(side="left", padx=6)
+        ttk.Label(ranks, text="Rank by:").pack(side="left", padx=(10, 2))
+        ttk.Combobox(ranks, textvariable=self.rank_by, values=list(Index.RANK_BY.values()),
+                     state="readonly", width=19).pack(side="left")
+        ttk.Label(ranks, text="Min. staff:").pack(side="left", padx=(8, 2))
+        ttk.Spinbox(ranks, from_=1, to=1000, textvariable=self.min_employees, width=4).pack(side="left")
+        ttk.Label(ranks, text="Min. days:").pack(side="left", padx=(8, 2))
+        ttk.Spinbox(ranks, from_=1, to=31, textvariable=self.min_days, width=3).pack(side="left")
+        ttk.Label(ranks, text="City:").pack(side="left", padx=(8, 2))
+        ttk.Entry(ranks, textvariable=self.city, width=12).pack(side="left")
+        ttk.Label(ranks, text="Top:").pack(side="left", padx=(8, 2))
+        ttk.Combobox(ranks, textvariable=self.top_n, values=["50", "100", "500", "1000"],
+                     state="readonly", width=6).pack(side="left")
 
         panes = ttk.PanedWindow(self.root, orient="vertical")
         panes.pack(fill="both", expand=True, padx=8)
@@ -147,7 +172,7 @@ class App:
         tree.delete(*tree.get_children())
         tree["columns"] = [c[0] for c in columns]
         for key, title, width in columns:
-            numeric = key in ("salary", "total", "count", "days")
+            numeric = key in ("salary", "total", "count", "days", "rank", "avg", "per_day", "max", "pdfs")
             tree.heading(key, text=title, anchor="e" if numeric else "w")
             tree.column(key, width=width, anchor="e" if numeric else "w", stretch=key in ("name", "company"))
 
@@ -276,7 +301,8 @@ class App:
         if not q:
             return
         t = time.perf_counter()
-        if self.mode.get() == "company":
+        self.view = self.mode.get()
+        if self.view == "company":
             self.results = self.index.search_company(q)
             self._set_columns(self.tree, [("company", "Company", 260), ("city", "City", 120),
                                           ("aff", "Affiliation n°", 100), ("count", "Employees", 80),
@@ -305,6 +331,67 @@ class App:
         if n:
             self.tree.selection_set("0")
 
+    # ---------- rankings ----------
+
+    def _rank_options(self) -> tuple[str, int, int, str, int]:
+        by = next(k for k, v in Index.RANK_BY.items() if v == self.rank_by.get())
+
+        def number(var: tk.StringVar) -> int:
+            try:
+                return max(1, int(var.get()))
+            except ValueError:
+                return 1
+        return by, number(self.min_employees), number(self.min_days), self.city.get().strip(), int(self.top_n.get())
+
+    @staticmethod
+    def _days_note(min_days: int) -> str:
+        if min_days <= 1:
+            return ""
+        return (" Only full-month declarations count." if min_days >= 26
+                else f" Only declarations with at least {min_days} days worked count.")
+
+    def rank_companies(self) -> None:
+        by, min_emp, min_days, city, top = self._rank_options()
+        self.view = "top_companies"
+        self.results = self.index.top_companies(by=by, min_employees=min_emp, city=city, limit=top,
+                                                min_days=min_days)
+        self._set_columns(self.tree, [("rank", "#", 45), ("company", "Company", 250), ("city", "City", 110),
+                                      ("count", "Employees", 80), ("avg", "Avg salary (DH)", 120),
+                                      ("per_day", "Avg per day (DH)", 120), ("max", "Highest salary", 110),
+                                      ("pdfs", "PDFs", 50)])
+        for i, r in enumerate(self.results):
+            self.tree.insert("", "end", iid=str(i), values=(
+                i + 1, r["company"], r["city"], r["people"], fmt_money(r["avg_salary"]),
+                fmt_money(r["avg_day"]), fmt_money(r["max_salary"]), r["pdfs"]))
+        where = f" in {city.upper()}" if city else ""
+        self._ranked(f"Top {len(self.results):,} companies{where} by average"
+                     f" {'salary per day worked' if by == 'per_day' else 'declared salary'},"
+                     f" counting companies with at least {min_emp} employee{'s' if min_emp > 1 else ''}."
+                     " A company found in several PDFs is counted once." + self._days_note(min_days))
+
+    def rank_people(self) -> None:
+        by, _, min_days, city, top = self._rank_options()
+        self.view = "top_people"
+        self.results = self.index.top_earners(by=by, city=city, limit=top, min_days=min_days)
+        self._set_columns(self.tree, [("rank", "#", 45), ("name", "Employee", 210), ("ref", "CNSS n°", 95),
+                                      ("company", "Company", 220), ("city", "City", 110),
+                                      ("period", "Period", 65), ("days", "Days", 45),
+                                      ("salary", "Salary (DH)", 105), ("per_day", "Per day (DH)", 100)])
+        for i, r in enumerate(self.results):
+            self.tree.insert("", "end", iid=str(i), values=(
+                i + 1, r["name"], r["ref"], r["company"], r["city"], r["period"],
+                "" if r["days"] is None else r["days"], fmt_money(r["salary"]), fmt_money(r["per_day"])))
+        where = f" in {city.upper()}" if city else ""
+        self._ranked(f"Top {len(self.results):,} employees{where} by"
+                     f" {'salary per day worked' if by == 'per_day' else 'declared salary'}."
+                     " Each person is listed once, with their highest declaration." + self._days_note(min_days))
+
+    def _ranked(self, text: str) -> None:
+        self.count_lbl.configure(text=text if self.results else "Nothing to rank with these filters.")
+        self._show_company(None)
+        if self.results:
+            self.tree.selection_set("0")
+
     @staticmethod
     def _file_name(source: str) -> str:
         return Path(source.split(ZIP_SEP, 1)[-1]).name
@@ -317,8 +404,10 @@ class App:
         r = self._selected()
         if r is None:
             return
-        if self.mode.get() == "company":
+        if self.view == "company":
             self._show_company(r)
+        elif self.view == "top_companies":
+            self._show_company(self.index.company(r["cid"]))
         else:
             self._show_company(self.index.company(r["company_id"]), highlight=r["ref"] or r["name"])
 
@@ -382,9 +471,15 @@ class App:
                                             initialfile="search_results.csv")
         if not path:
             return
+        if self.view.startswith("top_"):
+            # Rankings: export exactly the columns shown.
+            header = [self.tree.heading(c)["text"] for c in self.tree["columns"]]
+            rows = [self.tree.item(i)["values"] for i in self.tree.get_children()]
+            self._write_csv(path, header, rows)
+            return
         header = ["Company", "City", "Affiliation n°", "Employee", "CNSS n°", "Period", "Days", "Salary (DH)", "PDF"]
         rows = []
-        if self.mode.get() == "company":
+        if self.view == "company":
             for c in self.results:
                 d = c["details"]
                 base = [c["company"], d.get("Ville", ""), d.get("N° d'affiliation", "")]
@@ -396,6 +491,10 @@ class App:
             for r in self.results:
                 rows.append([r["company"], r["city"], "", r["name"], r["ref"], r["period"], r["days"] or "",
                              fmt_money(r["salary"]), self._file_name(r["source"])])
+        self._write_csv(path, header, rows)
+
+    @staticmethod
+    def _write_csv(path: str, header: list, rows: list) -> None:
         # utf-8-sig + ";" so Excel (French/Moroccan settings) opens it with accents and columns intact.
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")

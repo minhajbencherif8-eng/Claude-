@@ -3,6 +3,8 @@
     python -m pdf_research index my_pdfs.zip
     python -m pdf_research company "SONACOS"
     python -m pdf_research person "CHAFAI SAMIR"
+    python -m pdf_research top-companies --min-employees 5
+    python -m pdf_research top-earners --city casablanca
     python -m pdf_research app                 # desktop app with a "Select ZIP File" button
 """
 
@@ -100,6 +102,31 @@ def cmd_person(args) -> int:
     return 0
 
 
+def _money(v) -> str:
+    return "" if v is None else f"{v:,.2f}"
+
+
+def cmd_top_companies(args) -> int:
+    idx = Index(args.db)
+    rows = idx.top_companies(by=args.by, min_employees=args.min_employees, city=args.city, limit=args.limit,
+                             min_days=args.min_days)
+    idx.close()
+    print(_table(["#", "Company", "City", "Employees", "Avg salary", "Avg per day", "Highest", "PDFs"],
+                 [[i, r["company"], r["city"], r["people"], _money(r["avg_salary"]), _money(r["avg_day"]),
+                   _money(r["max_salary"]), r["pdfs"]] for i, r in enumerate(rows, 1)]))
+    return 0 if rows else 1
+
+
+def cmd_top_earners(args) -> int:
+    idx = Index(args.db)
+    rows = idx.top_earners(by=args.by, city=args.city, limit=args.limit, min_days=args.min_days)
+    idx.close()
+    print(_table(["#", "Employee", "CNSS n°", "Company", "City", "Period", "Days", "Salary", "Per day"],
+                 [[i, r["name"], r["ref"], r["company"], r["city"], r["period"], r["days"],
+                   _money(r["salary"]), _money(r["per_day"])] for i, r in enumerate(rows, 1)]))
+    return 0 if rows else 1
+
+
 def cmd_stats(args) -> int:
     idx = Index(args.db)
     s = idx.stats()
@@ -125,6 +152,20 @@ def main(argv: list[str] | None = None) -> int:
         s = sub.add_parser(name, help=help_)
         s.add_argument("query", help="full or partial name, or a CNSS/affiliation number")
         s.add_argument("--json", action="store_true", help="print results as JSON")
+        s.set_defaults(func=func)
+
+    for name, func, help_ in (("top-companies", cmd_top_companies, "companies with the highest average salary"),
+                              ("top-earners", cmd_top_earners, "highest-paid employees")):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("--by", choices=["salary", "per_day"], default="salary",
+                       help="rank by declared salary (default) or salary per day worked")
+        s.add_argument("--city", default="", help="only this city (partial name is fine)")
+        s.add_argument("--limit", type=int, default=50, help="how many to show (default 50)")
+        s.add_argument("--min-days", type=int, default=1,
+                       help="only count declarations with at least this many days worked (26 = full months)")
+        if name == "top-companies":
+            s.add_argument("--min-employees", type=int, default=3,
+                           help="ignore companies with fewer employees (default 3)")
         s.set_defaults(func=func)
 
     sub.add_parser("stats", help="what is in the database").set_defaults(func=cmd_stats)

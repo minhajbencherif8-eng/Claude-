@@ -156,7 +156,7 @@ def test_search_company(index):
 
 
 def test_search_company_by_affiliation_number(index):
-    assert {c["company"] for c in index.search_company("1234567")} == {"ATLAS TEXTILE S A", "SOCIETE VIDE SARL"}
+    assert [c["company"] for c in index.search_company("1234567")] == ["ATLAS TEXTILE S A"]
 
 
 def test_search_person_any_order_and_case(index):
@@ -222,3 +222,77 @@ def test_cli(sample_zip, tmp_path, capsys):
     assert cli(["--db", db, "person", "el amrani"]) == 0
     assert "ATLAS TEXTILE S A" in capsys.readouterr().out
     assert cli(["--db", db, "company", "nothing like this"]) == 1
+
+
+# ---------- rankings ----------
+
+def _ranking_db(tmp_path, samples):
+    """Index the samples, with ATLAS present twice (two PDFs of the same company)."""
+    archive = tmp_path / "pdfs.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for pdf in sorted(samples.glob("*.pdf")):
+            zf.write(pdf, pdf.name)
+        zf.write(samples / "cnss_atlas.pdf", "copy/cnss_atlas_again.pdf")
+    idx = Index(tmp_path / "db.sqlite")
+    idx.build(archive, workers=1)
+    return idx
+
+
+def test_top_companies_by_average_salary(samples, tmp_path):
+    idx = _ranking_db(tmp_path, samples)
+    rows = idx.top_companies(min_employees=1)
+    assert [r["company"] for r in rows] == [
+        "Acme Robotics Ltd", "Nordic Timber AS", "ATLAS TEXTILE S A", "Boulangerie Dupré SARL"]
+    atlas = rows[2]
+    # The duplicate PDF is counted once: 3 people, not 6.
+    assert (atlas["people"], atlas["pdfs"]) == (3, 2)
+    assert atlas["avg_salary"] == pytest.approx((9307.64 + 12450.0 + 3100.5) / 3)
+    assert atlas["avg_day"] == pytest.approx((9307.64 / 26 + 12450.0 / 15 + 3100.5 / 8) / 3)
+    # Companies with no employees are never ranked.
+    assert "SOCIETE VIDE SARL" not in {r["company"] for r in rows}
+    idx.close()
+
+
+def test_top_companies_filters(samples, tmp_path):
+    idx = _ranking_db(tmp_path, samples)
+    assert [r["company"] for r in idx.top_companies(city="casa")] == ["ATLAS TEXTILE S A"]
+    assert idx.top_companies(min_employees=4) == []
+    # Per-day ranking only covers companies that report days worked.
+    assert [r["company"] for r in idx.top_companies(by="per_day")] == ["ATLAS TEXTILE S A"]
+    assert len(idx.top_companies(limit=2)) == 2
+    idx.close()
+
+
+def test_top_earners(samples, tmp_path):
+    idx = _ranking_db(tmp_path, samples)
+    rows = idx.top_earners(limit=3)
+    assert [(r["name"], r["salary"]) for r in rows] == [
+        ("John Smith", 120000.0), ("Ingrid Hansen", 95000.0), ("Maria Garcia", 85500.0)]
+    cnss = idx.top_earners(city="casablanca")
+    # Each person once, even though ATLAS is in two PDFs.
+    assert [r["name"] for r in cnss] == ["BENNANI FATIMA ZAHRA", "EL AMRANI YOUSSEF", "SMITH JOHN"]
+    per_day = idx.top_earners(by="per_day")
+    assert per_day[0]["name"] == "BENNANI FATIMA ZAHRA"
+    assert per_day[0]["per_day"] == pytest.approx(12450.0 / 15)
+    idx.close()
+
+
+def test_cli_rankings(sample_zip, tmp_path, capsys):
+    db = str(tmp_path / "db.sqlite")
+    cli(["--db", db, "index", str(sample_zip)])
+    capsys.readouterr()
+    assert cli(["--db", db, "top-companies", "--min-employees", "1", "--limit", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "Acme Robotics Ltd" in out and "Boulangerie" not in out
+    assert cli(["--db", db, "top-earners", "--by", "per_day"]) == 0
+    assert "BENNANI FATIMA ZAHRA" in capsys.readouterr().out
+
+
+def test_rankings_min_days(samples, tmp_path):
+    idx = _ranking_db(tmp_path, samples)
+    # Only EL AMRANI worked 26 days; PDFs without days worked drop out.
+    assert [r["name"] for r in idx.top_earners(min_days=26)] == ["EL AMRANI YOUSSEF"]
+    [atlas] = idx.top_companies(min_days=15)
+    assert (atlas["company"], atlas["people"]) == ("ATLAS TEXTILE S A", 2)
+    assert atlas["avg_salary"] == pytest.approx((9307.64 + 12450.0) / 2)
+    idx.close()

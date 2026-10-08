@@ -28,6 +28,16 @@ No Python needed. (If you'd rather run it with Python: install Python 3.10+ from
    - **Export to Excel (CSV)** saves the current results.
    - **Import report** lists PDFs that could not be read or need a check. For example, a PDF where the employees don't add up to the PDF's TOTAL line, or a scanned PDF with no text.
 
+4. **Rankings** (third row):
+   - **Top companies by avg salary**: companies ranked by the average declared salary of their employees. Also shows the average per day worked, the highest salary, and how many PDFs the company appears in.
+   - **Top earners**: the highest-paid people, each listed once with their highest declaration.
+   - **Rank by**: *Salary* (as declared) or *Salary per day worked*. The per-day option evens out people who only worked part of the month.
+   - **Min. staff** leaves out companies with very few employees (default 3), since one or two people would make an average misleading.
+   - **Min. days** only counts declarations with at least that many days worked. Set it to 26 to compare full-month salaries only.
+   - **City** narrows the ranking to one city, and **Top** sets how many rows to show.
+   - A company found in several PDFs is counted once (grouped by affiliation n°), and so is a person (grouped by CNSS n°).
+   - Click a row to see the company's details, and use **Export to Excel (CSV)** to save the ranking.
+
 The database is stored in `%LOCALAPPDATA%\PDFResearch\index.sqlite`. Delete that folder to start over.
 
 ## Command line (optional)
@@ -37,6 +47,8 @@ pip install -r requirements.txt
 python -m pdf_research index my_pdfs.zip
 python -m pdf_research company "SONACOS"
 python -m pdf_research person "CHAFAI SAMIR"
+python -m pdf_research top-companies --min-employees 5 --min-days 26
+python -m pdf_research top-earners --city casablanca --by per_day
 python -m pdf_research stats
 ```
 

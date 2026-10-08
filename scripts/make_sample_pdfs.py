@@ -62,7 +62,7 @@ def text_lines(path):
     ])
 
 
-def cnss(path, company, employees, city="CASABLANCA"):
+def cnss(path, company, employees, city="CASABLANCA", affiliation="1234567"):
     """Same text layout as a CNSS "Attestation des salariés déclarés" (fake data)."""
     p = lambda t: Paragraph(t, STYLES["Normal"])  # noqa: E731
     months = ["décembre 2023", "janvier 2024", "février 2024"]
@@ -72,7 +72,7 @@ def cnss(path, company, employees, city="CASABLANCA"):
         p("Attestation des salariés déclarés"), p("Attestation n°:"), p("202400009999001"),
         p("atteste que:"),
         p(f"Nom/Raison Sociale: {company}"), p("Activité exercée: TEST ACTIVITE"),
-        p("Adresse: 1 RUE DES TESTS"), p(f"Ville: {city}"), p("N° d'affiliation: 1234567"),
+        p("Adresse: 1 RUE DES TESTS"), p(f"Ville: {city}"), p(f"N° d'affiliation: {affiliation}"),
         p("Identifiant Commun de l'Entreprise: :"), p("Forme Juridique: Société Anonyme"),
         p("A déclaré à la Caisse Nationale de Sécurité (2) du : 1 2 2 0 2 3"),
         p("au : 0 2 2 0 2 4"),
@@ -99,7 +99,7 @@ def main(out):
         ("100000002", "BENNANI FATIMA ZAHRA", 15, 12450.00),
         ("100000003", "SMITH JOHN", 8, 3100.50),
     ])
-    cnss(out / "cnss_empty.pdf", "SOCIETE VIDE SARL", [], city="RABAT")
+    cnss(out / "cnss_empty.pdf", "SOCIETE VIDE SARL", [], city="RABAT", affiliation="7654321")
     print(f"Wrote 5 sample PDFs to {out}/")
 
 
