@@ -1,55 +1,58 @@
-# Company & People Search for PDFs
+# Company & Employee Search
 
-Search a folder (or `.zip`) of company PDFs:
+A Windows desktop app for a ZIP of company PDFs (CNSS *Attestation des salariés déclarés* and similar):
 
-- **by company name** to get the company's details and every person who works there, with their salary
-- **by person name** to see where that person works and their salary (across all PDFs)
+- **Search by company** to see its details (address, city, affiliation n°, ICE, RC, legal form, monthly declarations) and every declared employee with CNSS n°, days worked and salary.
+- **Search by employee** to see every company where that person appears, with their salary.
 
-Searches ignore upper/lower case and accents (`dupre` finds `Dupré`), accept words in any order (`smith john`), and tolerate small typos (`Ingird` finds `Ingrid`).
+**Everything stays on your computer.** The app reads the PDFs straight from your ZIP (it doesn't even extract them to disk), saves what it finds in a local database, and never connects to the internet.
 
-## Setup
+## Install (Windows)
 
-```bash
-pip install -r requirements.txt     # Python 3.10+
-```
+1. Open this repository's **Releases** page on GitHub and download the latest `CompanyEmployeeSearch.exe`.
+2. Double-click it. The `.exe` isn't code-signed, so Windows may show "Windows protected your PC". Click **More info → Run anyway**.
+
+No Python needed. (If you'd rather run it with Python: install Python 3.10+ from python.org, download this repository, and double-click `run_app.bat`.)
 
 ## Use
 
+1. Click **Select ZIP File…** and choose your ZIP. This is needed **only once**.
+   - The app reads all the PDFs using every CPU core and shows its progress and the time left. Expect roughly 10–20 PDFs per second, depending on your PC.
+   - You can click **Stop** or close the app at any time. Select the same ZIP again later and it continues where it stopped.
+   - If you later get an updated ZIP, select it again: only new or changed PDFs are read, and PDFs no longer in the ZIP are removed.
+2. Choose **Company** or **Employee**, type a name, and press Enter.
+   - Upper/lower case and accents don't matter, words can be in any order (`samir chafai`), and small typos are tolerated (`chafay`).
+   - You can also type a number: an affiliation n°, ICE or RC for companies, or a CNSS n° for employees.
+3. Click a result to see the company's details and its full employee list (the person you searched for is highlighted).
+   - **Open PDF** shows the original document.
+   - **Export to Excel (CSV)** saves the current results.
+   - **Import report** lists PDFs that could not be read or need a check. For example, a PDF where the employees don't add up to the PDF's TOTAL line, or a scanned PDF with no text.
+
+The database is stored in `%LOCALAPPDATA%\PDFResearch\index.sqlite`. Delete that folder to start over.
+
+## Command line (optional)
+
 ```bash
-# 1. Read the PDFs once (a folder or a .zip). Re-run after adding or changing PDFs;
-#    only new or changed files are read again.
+pip install -r requirements.txt
 python -m pdf_research index my_pdfs.zip
-
-# 2. Search
-python -m pdf_research company "Acme"
-python -m pdf_research person "John Smith"
-python -m pdf_research list                 # every company found, and any PDF that needs a look
-
-# Or use the search page in your browser at http://127.0.0.1:8000
-python -m pdf_research serve
+python -m pdf_research company "SONACOS"
+python -m pdf_research person "CHAFAI SAMIR"
+python -m pdf_research stats
 ```
 
-Add `--json` to `company` / `person` for machine-readable output.
+It uses the same database as the app.
 
-## What the PDFs can look like
+## How the PDFs are read
 
-The tool reads text-based PDFs (not scans) and recognises, in English or French:
-
-- **Company name** from a labelled line such as `Company: …`, `Entreprise : …`, `Raison sociale : …`, `Société : …`; otherwise the first line of the PDF.
-- **Company details**: every other `Label: value` line (address, SIRET, sector, …).
-- **Employees** from a table whose header has a name column (`Name`, `Nom`, `Employee`, or separate `Nom` / `Prénom` / `First name` / `Last name`) and a salary column (`Salary`, `Salaire`, `Brut`, `Net`, `Wage`, …); an optional `Position` / `Poste` / `Fonction` column is picked up too.
-- **Employees without a table**: lines like `Ingrid Hansen - Director - 95 000 EUR`.
-
-`index` warns about any PDF where it found no employees. That usually means a scanned PDF (it needs OCR first) or a layout the rules above don't cover yet.
-
-## Privacy
-
-Salary data is personal data. The index (`research_index.sqlite`) stays on your computer, the search page only listens on `127.0.0.1`, and `.gitignore` keeps PDFs, zips and the index out of git.
+- **CNSS attestations**: company fields come from the labelled lines (`Nom/Raison Sociale`, `Adresse`, `Ville`, `N° d'affiliation`, …), the monthly table from page 1, and the employees from the annex (`N° d'immatriculation, Nom et prénom, Nombre de jours, Salaire déclaré`). Employee totals are checked against the PDF's `TOTAL` line.
+- **Other layouts**: a `Company:`/`Entreprise :` line, and employee tables with name and salary columns (English or French), or lines like `Name - Position - 3 000 €`.
 
 ## Development
 
 ```bash
 pip install -r requirements-dev.txt
-python scripts/make_sample_pdfs.py samples/   # fake PDFs in 3 layouts to try the tool
 python -m pytest
+python scripts/make_sample_pdfs.py samples/   # fake PDFs (incl. CNSS layout) to try the app
 ```
+
+Each push builds the Windows `.exe` with GitHub Actions (`.github/workflows/windows-app.yml`). The build runs the tests on Windows, checks that the `.exe` can import a ZIP, and publishes the `.exe` on the Releases page.

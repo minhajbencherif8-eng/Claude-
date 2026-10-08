@@ -1,6 +1,8 @@
 """Extract a company, its details and its employees (with salaries) from a PDF.
 
-PDF layouts vary, so extraction is heuristic and works in two passes:
+CNSS "Attestation des salariés déclarés" forms (Morocco) have a dedicated
+parser, see `parse_cnss`. Any other layout goes through heuristic extraction
+in two passes:
 
 1. Tables: any table whose header has a name column and a salary column
    (English or French labels) yields one employee per row.
@@ -14,13 +16,14 @@ Every other "Label: value" line is kept as a company detail.
 
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pdfplumber
 
-from .textutil import MONEY_RE, clean, normalize, parse_amount
+from .textutil import MONEY_RE, clean, normalize, parse_amount, strip_arabic
 
 COMPANY_LABELS = (
     "company name", "company", "enterprise", "entreprise", "nom de l entreprise",
@@ -61,6 +64,9 @@ class Employee:
     salary_raw: str = ""
     salary: float | None = None
     position: str = ""
+    ref: str = ""  # e.g. CNSS "N° d'immatriculation"
+    days: int | None = None
+    period: str = ""  # e.g. "08/2023"
 
 
 @dataclass
@@ -70,6 +76,8 @@ class CompanyRecord:
     details: dict[str, str] = field(default_factory=dict)
     employees: list[Employee] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Monthly totals: {"month": "décembre 2023", "employees": 7, "payroll": "34 863,89"}
+    payroll: list[dict] = field(default_factory=list)
 
 
 def _find_col(header: list[str], candidates: tuple[str, ...], exclude: set[int]) -> int | None:
@@ -163,17 +171,113 @@ def _company_from_details(details: dict[str, str]) -> str | None:
     return None
 
 
-def extract(path: str | Path) -> CompanyRecord:
+# ---------- CNSS "Attestation des salariés déclarés" ----------
+
+_CNSS_MARKERS = ("Raison Sociale", "salariés déclarés")
+_CNSS_FIELD = re.compile(r"^(?P<label>[A-Za-zÀ-ÿ°'’/ ]{3,45}?)\s*:\s*(?P<value>.*?)[\s:]*$")
+_CNSS_FIELDS = (
+    "Activité exercée", "Adresse", "Ville", "N° d'affiliation", "Date d'affiliation",
+    "Identifiant Commun de l'Entreprise", "N° Registre de commerce", "N° Taxe Professionnelle",
+    "Identifiant Fiscal", "Forme Juridique",
+)
+_DH = r"\d{1,3}(?: \d{3})*,\d{2}"
+_CNSS_EMPLOYEE = re.compile(rf"^(?P<ref>\d{{6,12}}) (?P<name>\D+?) (?P<days>\d{{1,3}}) (?P<salary>{_DH})$")
+_CNSS_TOTAL = re.compile(rf"^TOTAL (?P<amount>{_DH})$")
+_CNSS_MONTH = re.compile(
+    rf"^(?P<month>(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)"
+    rf" \d{{4}}) (?:NEANT|(?P<count>\d+) (?P<payroll>{_DH}))$",
+    re.IGNORECASE,
+)
+_SPACED_MONTH = r"((?:\d\s?){6})"  # "1 2 2 0 2 3" -> 12/2023
+
+
+def _month(spaced: str) -> str:
+    d = re.sub(r"\D", "", spaced)
+    return f"{d[:2]}/{d[2:]}"
+
+
+def is_cnss(text: str) -> bool:
+    return all(m in text for m in _CNSS_MARKERS)
+
+
+def parse_cnss(text: str, source: str) -> CompanyRecord:
+    lines = [clean(strip_arabic(l)) for l in text.splitlines()]
+    lines = [l for l in lines if l]
+    flat = " ".join(lines)
+    rec = CompanyRecord(source=source, company="")
+
+    for line in lines:
+        m = _CNSS_FIELD.match(line)
+        if not m:
+            continue
+        label, value = m.group("label").strip(), m.group("value").strip(" :/")
+        if label == "Nom/Raison Sociale":
+            rec.company = rec.company or value
+        elif label in _CNSS_FIELDS and value and label not in rec.details:
+            rec.details[label] = value
+
+    if m := re.search(r"Attestation n°\s*:?\s*:?\s*(\d{8,})", flat):
+        rec.details["Attestation n°"] = m.group(1)
+    start = re.search(r"\bdu\s*:\s*" + _SPACED_MONTH, flat)
+    end = re.search(r"\bau\s*:\s*" + _SPACED_MONTH, flat)
+    if start and end:
+        rec.details["Période déclarée"] = f"{_month(start.group(1))} - {_month(end.group(1))}"
+
+    period, total = "", None
+    for line in lines:
+        if m := re.match(r"^Période " + _SPACED_MONTH + "$", line):
+            period = _month(m.group(1))
+        elif m := _CNSS_EMPLOYEE.match(line):
+            rec.employees.append(Employee(
+                name=m.group("name").strip(), salary_raw=m.group("salary"),
+                salary=parse_amount(m.group("salary")), ref=m.group("ref"),
+                days=int(m.group("days")), period=period,
+            ))
+        elif m := _CNSS_TOTAL.match(line):
+            total = (total or 0) + parse_amount(m.group("amount"))
+        elif m := _CNSS_MONTH.match(line):
+            rec.payroll.append({
+                "month": m.group("month"),
+                "employees": int(m.group("count")) if m.group("count") else 0,
+                "payroll": m.group("payroll") or "",
+            })
+    if period:
+        rec.details["Période des salaires (annexe)"] = period
+
+    if not rec.company:
+        rec.company = Path(source).stem
+        rec.warnings.append("company name not found")
+    found = round(sum(e.salary or 0 for e in rec.employees), 2)
+    if total is not None and abs(found - total) > 0.01:
+        rec.warnings.append(f"employees add up to {found:,.2f} but the PDF's TOTAL is {total:,.2f}"
+                            " (some employee lines were not read)")
+    if total is None and rec.employees:
+        rec.warnings.append("no TOTAL line found to check the employee list")
+    return rec
+
+
+# ---------- entry point ----------
+
+def extract(path: str | Path, data: bytes | None = None) -> CompanyRecord:
+    """Read a PDF from `path`, or from `data` (bytes) labelled with `path`."""
     path = Path(path)
+    source = io.BytesIO(data) if data is not None else path
+    with pdfplumber.open(source) as pdf:
+        texts = [page.extract_text() or "" for page in pdf.pages]
+        full = "\n".join(texts)
+        if is_cnss(full):
+            return parse_cnss(full, str(path))
+        return _extract_generic(pdf, texts, path)
+
+
+def _extract_generic(pdf, texts: list[str], path: Path) -> CompanyRecord:
     lines: list[str] = []
     employees: list[Employee] = []
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            lines.extend(clean(l) for l in (page.extract_text() or "").splitlines())
-            for table in page.extract_tables():
-                employees.extend(_employees_from_table(table))
+    for page, text in zip(pdf.pages, texts):
+        lines.extend(clean(l) for l in text.splitlines())
+        for table in page.extract_tables():
+            employees.extend(_employees_from_table(table))
     lines = [l for l in lines if l]
-
     record = CompanyRecord(source=str(path), company="")
     if not lines:
         record.company = path.stem

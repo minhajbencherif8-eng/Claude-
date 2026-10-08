@@ -50,3 +50,11 @@ def parse_amount(raw: str) -> float | None:
 
 def clean(text: str | None) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+_ARABIC = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff]+")
+
+
+def strip_arabic(text: str) -> str:
+    """Drop Arabic script (bilingual forms repeat every French label in Arabic)."""
+    return _ARABIC.sub(" ", text)

@@ -1,9 +1,9 @@
-"""Command line: index a folder of PDFs, then search by company or person.
+"""Command line: index PDFs from a .zip or folder, then search by company or person.
 
-    python -m pdf_research index ./pdfs        (or ./pdfs.zip)
-    python -m pdf_research company "Acme"
-    python -m pdf_research person "John Smith"
-    python -m pdf_research serve          # web page on http://127.0.0.1:8000
+    python -m pdf_research index my_pdfs.zip
+    python -m pdf_research company "SONACOS"
+    python -m pdf_research person "CHAFAI SAMIR"
+    python -m pdf_research app                 # desktop app with a "Select ZIP File" button
 """
 
 from __future__ import annotations
@@ -11,55 +11,48 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import zipfile
 from pathlib import Path
 
-from .index import Index
+from .index import ZIP_SEP, Index
 
-DEFAULT_DB = Path("research_index.sqlite")
+
+def _default_db() -> Path:
+    from .app import data_dir  # same database as the desktop app
+    return data_dir() / "index.sqlite"
 
 
 def _salary(e: dict) -> str:
     return e["salary_raw"] or ("" if e["salary"] is None else f"{e['salary']:,.2f}")
 
 
-def _table(headers: list[str], rows: list[list[str]]) -> str:
-    widths = [max(len(str(x)) for x in col) for col in zip(headers, *rows)]
+def _file(source: str) -> str:
+    return Path(source.split(ZIP_SEP, 1)[-1]).name
+
+
+def _table(headers: list[str], rows: list[list]) -> str:
+    rows = [["" if x is None else str(x) for x in r] for r in rows]
+    widths = [max(len(x) for x in col) for col in zip(headers, *rows)]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    lines = [fmt.format(*headers), "  ".join("-" * w for w in widths)]
-    lines += [fmt.format(*map(str, r)) for r in rows]
-    return "\n".join(lines)
-
-
-def unzip(archive: Path) -> Path:
-    """Extract a .zip next to itself (e.g. pdfs.zip -> pdfs/) and return that folder."""
-    dest = archive.with_suffix("")
-    root = dest.resolve()
-    with zipfile.ZipFile(archive) as zf:
-        for member in zf.infolist():
-            # Refuse entries that would land outside the destination ("../" or absolute paths).
-            if not (root / member.filename).resolve().is_relative_to(root):
-                raise ValueError(f"unsafe path in zip: {member.filename}")
-        zf.extractall(dest)
-    return dest
+    return "\n".join([fmt.format(*headers), "  ".join("-" * w for w in widths)] + [fmt.format(*r) for r in rows])
 
 
 def cmd_index(args) -> int:
-    folder = Path(args.folder)
-    if folder.is_file() and folder.suffix.lower() == ".zip":
-        folder = unzip(folder)
-        print(f"Extracted to {folder}/")
-    if not folder.is_dir():
-        print(f"Not a folder: {folder}", file=sys.stderr)
+    source = Path(args.source)
+    if not source.exists():
+        print(f"Not found: {source}", file=sys.stderr)
         return 2
     idx = Index(args.db)
-    rep = idx.build(folder, progress=lambda p: print(f"  reading {p}"))
+
+    def progress(done, total, name):
+        print(f"\r  {done}/{total}  {Path(name).name[:60]:<60}", end="", flush=True)
+
+    rep = idx.build(source, progress=progress)
     idx.close()
-    print(f"\nAdded {rep.added}, updated {rep.updated}, removed {rep.removed}, unchanged {rep.unchanged}.")
+    print(f"\nRead {rep.added + rep.updated}, removed {rep.removed}, already indexed {rep.unchanged}.")
     for path, err in rep.failed:
-        print(f"  FAILED  {path}: {err}")
+        print(f"  FAILED  {_file(path)}: {err}")
     for path, warn in rep.warnings:
-        print(f"  WARNING {path}: {warn}")
+        print(f"  CHECK   {_file(path)}: {warn}")
     return 0
 
 
@@ -75,17 +68,19 @@ def cmd_company(args) -> int:
         return 1
     for c in results:
         print(f"\n=== {c['company']} ===")
-        print(f"File: {c['source']}")
         for k, v in c["details"].items():
             print(f"{k}: {v}")
+        print(f"PDF: {_file(c['source'])}")
+        for w in c["warnings"]:
+            print(f"WARNING: {w}")
         print()
         if c["employees"]:
-            print(_table(["Name", "Position", "Salary"],
-                         [[e["name"], e["position"], _salary(e)] for e in c["employees"]]))
+            print(_table(["Employee", "CNSS n°", "Period", "Days", "Salary"],
+                         [[e["name"], e["ref"], e["period"], e["days"], _salary(e)] for e in c["employees"]]))
             total = sum(e["salary"] or 0 for e in c["employees"])
-            print(f"\n{len(c['employees'])} people, total salaries {total:,.2f}")
+            print(f"\n{len(c['employees'])} employees, total salaries {total:,.2f}")
         else:
-            print("(no employees found in this PDF)")
+            print("(no employees declared in this PDF)")
     return 0
 
 
@@ -99,54 +94,48 @@ def cmd_person(args) -> int:
     if not results:
         print(f'No person matches "{args.query}".')
         return 1
-    print(_table(["Name", "Company", "Position", "Salary", "File"],
-                 [[r["name"], r["company"], r["position"], _salary(r), Path(r["source"]).name]
+    print(_table(["Employee", "CNSS n°", "Company", "City", "Period", "Days", "Salary"],
+                 [[r["name"], r["ref"], r["company"], r["city"], r["period"], r["days"], _salary(r)]
                   for r in results]))
     return 0
 
 
-def cmd_list(args) -> int:
+def cmd_stats(args) -> int:
     idx = Index(args.db)
-    companies = idx.list_companies()
+    s = idx.stats()
     idx.close()
-    print(_table(["Company", "People", "File", "Warnings"],
-                 [[c["company"], len(c["employees"]), Path(c["source"]).name, "; ".join(c["warnings"])]
-                  for c in companies]))
-    return 0
-
-
-def cmd_serve(args) -> int:
-    from .web import serve
-    serve(args.db, args.host, args.port)
+    print(f"Database: {args.db}")
+    print(f"{s['files']} PDFs, {s['companies']} companies, {s['employees']} employee entries,"
+          f" {s['warnings']} PDFs with warnings")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="pdf_research", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=str(DEFAULT_DB), help=f"index file (default: {DEFAULT_DB})")
+    p.add_argument("--db", default=None, help="database file (default: the desktop app's database)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("index", help="read all PDFs in a folder or .zip (re-run after adding PDFs)")
-    s.add_argument("folder", help="folder of PDFs, or a .zip of them")
+    s = sub.add_parser("index", help="read all PDFs in a .zip or folder (re-run to pick up changes)")
+    s.add_argument("source", help=".zip of PDFs, or a folder of PDFs")
     s.set_defaults(func=cmd_index)
 
-    for name, func, help_ in (("company", cmd_company, "find a company and its people"),
+    for name, func, help_ in (("company", cmd_company, "find a company and its employees"),
                               ("person", cmd_person, "find a person, their company and salary")):
         s = sub.add_parser(name, help=help_)
-        s.add_argument("query", help="full or partial name; case and accents are ignored")
+        s.add_argument("query", help="full or partial name, or a CNSS/affiliation number")
         s.add_argument("--json", action="store_true", help="print results as JSON")
         s.set_defaults(func=func)
 
-    s = sub.add_parser("list", help="list every indexed company")
-    s.set_defaults(func=cmd_list)
-
-    s = sub.add_parser("serve", help="open a search page in the browser")
-    s.add_argument("--host", default="127.0.0.1")
-    s.add_argument("--port", type=int, default=8000)
-    s.set_defaults(func=cmd_serve)
+    sub.add_parser("stats", help="what is in the database").set_defaults(func=cmd_stats)
+    sub.add_parser("app", help="open the desktop app").set_defaults(func=None)
 
     args = p.parse_args(argv)
+    if args.cmd == "app":
+        from .app import main as app_main
+        app_main(Path(args.db) if args.db else None)
+        return 0
+    args.db = args.db or str(_default_db())
     return args.func(args)
 
 

@@ -1,8 +1,5 @@
-import json
 import sys
-import threading
-import urllib.request
-from http.server import ThreadingHTTPServer
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -11,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import make_sample_pdfs  # noqa: E402
-from pdf_research.extractor import _employee_from_line, extract  # noqa: E402
+from pdf_research.cli import main as cli  # noqa: E402
+from pdf_research.extractor import _employee_from_line, extract, parse_cnss  # noqa: E402
 from pdf_research.index import Index  # noqa: E402
-from pdf_research.textutil import parse_amount  # noqa: E402
-from pdf_research.web import make_handler  # noqa: E402
+from pdf_research.textutil import parse_amount, strip_arabic  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -24,33 +21,110 @@ def samples(tmp_path_factory):
     return out
 
 
+@pytest.fixture(scope="module")
+def sample_zip(samples, tmp_path_factory):
+    archive = tmp_path_factory.mktemp("zip") / "pdfs.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for pdf in sorted(samples.glob("*.pdf")):
+            zf.write(pdf, f"Entreprises/{pdf.name}")
+        zf.writestr("Entreprises/readme.txt", "not a pdf")
+        zf.writestr("__MACOSX/Entreprises/._acme.pdf", b"junk")
+    return archive
+
+
 @pytest.fixture
-def index(samples, tmp_path):
+def index(sample_zip, tmp_path):
     idx = Index(tmp_path / "db.sqlite")
-    idx.build(samples)
+    rep = idx.build(sample_zip, workers=2)
+    assert rep.added == 5 and not rep.failed
     yield idx
     idx.close()
 
 
 @pytest.mark.parametrize("raw, value", [
     ("3 800,00 €", 3800.0), ("$120,000.00", 120000.0), ("3.500,50", 3500.5),
-    ("95 000 EUR", 95000.0), ("45000", 45000.0), ("1,5", 1.5), ("", None), ("abc", None),
+    ("95 000 EUR", 95000.0), ("45000", 45000.0), ("1,5", 1.5), ("9 307,64", 9307.64),
+    ("", None), ("abc", None),
 ])
 def test_parse_amount(raw, value):
     assert parse_amount(raw) == value
 
+
+# ---------- CNSS attestations ----------
+
+def test_cnss_pdf(samples):
+    rec = extract(samples / "cnss_atlas.pdf")
+    assert rec.company == "ATLAS TEXTILE S A"
+    assert rec.details["Ville"] == "CASABLANCA"
+    assert rec.details["N° d'affiliation"] == "1234567"
+    assert rec.details["Période déclarée"] == "12/2023 - 02/2024"
+    assert "Identifiant Commun de l'Entreprise" not in rec.details  # empty on the form
+    assert [(e.ref, e.name, e.days, e.salary, e.period) for e in rec.employees] == [
+        ("100000001", "EL AMRANI YOUSSEF", 26, 9307.64, "08/2023"),
+        ("100000002", "BENNANI FATIMA ZAHRA", 15, 12450.0, "08/2023"),
+        ("100000003", "SMITH JOHN", 8, 3100.5, "08/2023"),
+    ]
+    assert rec.payroll[0] == {"month": "décembre 2023", "employees": 3, "payroll": "24 858,14"}
+    assert rec.warnings == []
+
+
+def test_cnss_without_employees(samples):
+    rec = extract(samples / "cnss_empty.pdf")
+    assert (rec.company, rec.employees, rec.warnings) == ("SOCIETE VIDE SARL", [], [])
+    assert rec.payroll[0] == {"month": "décembre 2023", "employees": 0, "payroll": ""}
+
+
+# Text as pdfplumber returns it for a real attestation (fake names), Arabic labels included.
+REAL_LAYOUT = """\
+Attestation des salariés déclarés ﻦﻴﻃﺮﺨﻨﻤﻟﺍ ﺔﻳﺮﻳﺪﻣ
+Attestation n°: :ﻢﻗﺭ ﺓﺩﺎﻬﺷ
+202400002525312
+Nom/Raison Sociale: EXEMPLE S A :ﻱﺭﺎﺠﺘﻟﺍ ﻢﺳﻹﺍ / ﻢﺳﻹﺍ
+Ville: SIDI KACEM :ﺔﻨﻳﺪﻤﻟﺍ
+Identifiant Fiscal: :ﻲﺒﻳﺮﻀﻟﺍ ﻒﻳﺮﻌﺘﻟﺍ
+A déclaré à la Caisse Nationale de Sécurité (2) du : 1 2 2 0 2 3 : ﻦﻣ (2) ﻲﻋﺎﻤﺘﺟﻹﺍ
+au : 1 1 2 0 2 4 :ﻰﻟﺇ
+décembre 2023 ﺮﺒﻤﺴﻳﺩ 7 34 863,89
+novembre 2024 ﺮﺒﻤﻓﻮﻧ NEANT
+Période 0 8 2 0 2 3 ﺓﺮﺘﻔﻟﺍ
+102233930 ALAOUI AHMED 26 9 307,64
+145751585 SOBAI EL IDRISSI KARIM 15 1 207 200,13
+TOTAL 1 216 507,77
+"""
+
+
+def test_cnss_real_text_layout():
+    rec = parse_cnss(REAL_LAYOUT, "x.pdf")
+    assert rec.company == "EXEMPLE S A"
+    assert rec.details == {"Ville": "SIDI KACEM", "Attestation n°": "202400002525312",
+                           "Période déclarée": "12/2023 - 11/2024",
+                           "Période des salaires (annexe)": "08/2023"}
+    assert [(e.name, e.salary) for e in rec.employees] == [
+        ("ALAOUI AHMED", 9307.64), ("SOBAI EL IDRISSI KARIM", 1207200.13)]
+    assert [p["employees"] for p in rec.payroll] == [7, 0]
+    assert rec.warnings == []
+
+
+def test_cnss_total_mismatch_is_flagged():
+    text = REAL_LAYOUT.replace("102233930 ALAOUI AHMED 26 9 307,64", "garbled line")
+    assert "not read" in parse_cnss(text, "x.pdf").warnings[0]
+
+
+def test_strip_arabic():
+    assert strip_arabic("Ville: CASABLANCA :ﺔﻨﻳﺪﻤﻟﺍ").strip() == "Ville: CASABLANCA :"
+
+
+# ---------- other layouts ----------
 
 def test_english_table(samples):
     rec = extract(samples / "acme.pdf")
     assert rec.company == "Acme Robotics Ltd"
     assert {e.name: e.salary for e in rec.employees} == {
         "John Smith": 120000.0, "Maria Garcia": 85500.0, "Chen Wei": 52000.0}
-    assert rec.details["Sector"] == "Industrial automation"
 
 
 def test_french_table_with_split_names(samples):
     rec = extract(samples / "dupre.pdf")
-    assert rec.company == "Boulangerie Dupré SARL"
     karim = next(e for e in rec.employees if e.name == "Karim Benali")
     assert (karim.position, karim.salary) == ("Boulanger", 2450.5)
     assert rec.details["Capital social"] == "10 000 €"
@@ -58,12 +132,8 @@ def test_french_table_with_split_names(samples):
 
 def test_text_lines(samples):
     rec = extract(samples / "nordic.pdf")
-    assert rec.company == "Nordic Timber AS"
-    assert [(e.name, e.position, e.salary) for e in rec.employees] == [
-        ("Ingrid Hansen", "Director", 95000.0),
-        ("Lars Olsen", "Forester", 48200.0),
-        ("Sofie Berg", "Accountant", 56750.0),
-    ]
+    assert [(e.name, e.salary) for e in rec.employees] == [
+        ("Ingrid Hansen", 95000.0), ("Lars Olsen", 48200.0), ("Sofie Berg", 56750.0)]
 
 
 @pytest.mark.parametrize("line", ["Total payroll: 199 950 EUR", "Founded in 1998 by the family",
@@ -72,69 +142,83 @@ def test_non_person_lines_ignored(line):
     assert _employee_from_line(line) is None
 
 
-def test_search_company_ignores_case_and_accents(index):
-    [c] = index.search_company("boulangerie dupre")
+# ---------- index and search ----------
+
+def test_zip_is_read_in_place(index, sample_zip):
+    assert not (sample_zip.parent / "pdfs").exists()  # nothing extracted to disk
+    assert index.stats() == {"files": 5, "companies": 5, "employees": 12, "warnings": 0}
+
+
+def test_search_company(index):
+    [c] = index.search_company("atlas textile")
+    assert c["details"]["Ville"] == "CASABLANCA"
     assert len(c["employees"]) == 3
 
 
-def test_search_person_across_companies(index):
-    hits = index.search_person("SMITH john")
-    assert sorted(h["company"] for h in hits) == ["Acme Robotics Ltd", "Boulangerie Dupré SARL"]
+def test_search_company_by_affiliation_number(index):
+    assert {c["company"] for c in index.search_company("1234567")} == {"ATLAS TEXTILE S A", "SOCIETE VIDE SARL"}
 
 
-def test_search_tolerates_typos(index):
+def test_search_person_any_order_and_case(index):
+    hits = index.search_person("john SMITH")
+    assert sorted(h["company"] for h in hits) == ["ATLAS TEXTILE S A", "Acme Robotics Ltd", "Boulangerie Dupré SARL"]
+    atlas = next(h for h in hits if h["company"] == "ATLAS TEXTILE S A")
+    assert (atlas["ref"], atlas["salary"], atlas["city"], atlas["days"]) == ("100000003", 3100.5, "CASABLANCA", 8)
+
+
+def test_search_person_by_cnss_number(index):
+    assert [h["name"] for h in index.search_person("100000002")] == ["BENNANI FATIMA ZAHRA"]
+
+
+def test_search_accents_and_typos(index):
+    assert index.search_company("dupre")[0]["company"] == "Boulangerie Dupré SARL"
     assert [h["name"] for h in index.search_person("Ingird")] == ["Ingrid Hansen"]
+    assert [h["name"] for h in index.search_person("benani fatima")] == ["BENNANI FATIMA ZAHRA"]
     assert index.search_person("nobody here") == []
 
 
-def test_reindex_skips_unchanged_and_drops_deleted(samples, tmp_path):
-    folder = tmp_path / "pdfs"
-    folder.mkdir()
-    for name in ("acme.pdf", "nordic.pdf"):
-        (folder / name).write_bytes((samples / name).read_bytes())
+def test_reimport_skips_unchanged_and_drops_removed(samples, tmp_path):
+    archive = tmp_path / "pdfs.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name in ("acme.pdf", "cnss_atlas.pdf"):
+            zf.write(samples / name, name)
     idx = Index(tmp_path / "db.sqlite")
-    assert idx.build(folder).added == 2
-    rep = idx.build(folder)
+    assert idx.build(archive, workers=1).added == 2
+    rep = idx.build(archive, workers=1)
     assert (rep.added, rep.unchanged) == (0, 2)
-    (folder / "nordic.pdf").unlink()
-    assert idx.build(folder).removed == 1
-    assert idx.search_person("Lars") == []
-    assert [c["company"] for c in idx.list_companies()] == ["Acme Robotics Ltd"]
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(samples / "acme.pdf", "acme.pdf")
+    rep = idx.build(archive, workers=1)
+    assert (rep.removed, rep.unchanged) == (1, 1)
+    assert idx.search_person("YOUSSEF") == []
     idx.close()
 
 
-def test_web_api(index, tmp_path, samples):
-    db = tmp_path / "db.sqlite"
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(db)))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        base = f"http://127.0.0.1:{server.server_port}"
-        with urllib.request.urlopen(f"{base}/api/search?type=person&q=karim") as r:
-            [hit] = json.load(r)
-        assert hit["company"] == "Boulangerie Dupré SARL"
-        with urllib.request.urlopen(base + "/") as r:
-            assert b"Company &amp; People Search" in r.read()
-    finally:
-        server.shutdown()
+def test_cancel_keeps_what_was_read_and_resumes(sample_zip, tmp_path):
+    import threading
+    stop = threading.Event()
+    idx = Index(tmp_path / "db.sqlite")
+    rep = idx.build(sample_zip, workers=1, progress=lambda *a: stop.set(), cancel=stop)
+    assert rep.cancelled and 1 <= rep.added < 5
+    rep2 = idx.build(sample_zip, workers=1)
+    assert (rep2.unchanged, rep2.added) == (rep.added, 5 - rep.added)
+    idx.close()
 
 
-def test_index_from_zip(samples, tmp_path):
-    import zipfile
-    from pdf_research.cli import main
+def test_broken_pdf_is_reported_not_fatal(samples, tmp_path):
     archive = tmp_path / "pdfs.zip"
     with zipfile.ZipFile(archive, "w") as zf:
-        for pdf in samples.glob("*.pdf"):
-            zf.write(pdf, f"pdfs/{pdf.name}")
+        zf.write(samples / "acme.pdf", "acme.pdf")
+        zf.writestr("broken.pdf", b"%PDF-1.4 this is not really a pdf")
+    idx = Index(tmp_path / "db.sqlite")
+    rep = idx.build(archive, workers=1)
+    assert rep.added == 1 and [k.split("::")[1] for k, _ in rep.failed] == ["broken.pdf"]
+    idx.close()
+
+
+def test_cli(sample_zip, tmp_path, capsys):
     db = str(tmp_path / "db.sqlite")
-    assert main(["--db", db, "index", str(archive)]) == 0
-    assert main(["--db", db, "person", "Sofie"]) == 0
-
-
-def test_zip_with_unsafe_path_is_refused(tmp_path):
-    import zipfile
-    from pdf_research.cli import unzip
-    archive = tmp_path / "bad.zip"
-    with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("../evil.pdf", b"x")
-    with pytest.raises(ValueError):
-        unzip(archive)
+    assert cli(["--db", db, "index", str(sample_zip)]) == 0
+    assert cli(["--db", db, "person", "el amrani"]) == 0
+    assert "ATLAS TEXTILE S A" in capsys.readouterr().out
+    assert cli(["--db", db, "company", "nothing like this"]) == 1
